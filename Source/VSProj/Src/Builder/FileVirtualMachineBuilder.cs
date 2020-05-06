@@ -415,6 +415,11 @@ namespace IFix.Core
                 for (int i = 0; i < anonymousStoreyInfos.Length; i++)
                 {
                     int fieldNum = reader.ReadInt32();
+                    int[] fieldTypes = new int[fieldNum];
+                    for (int fieldIdx = 0; fieldIdx < fieldNum; ++fieldIdx)
+                    {
+                        fieldTypes[fieldIdx] = reader.ReadInt32();
+                    }
                     int ctorId = reader.ReadInt32();
                     int ctorParamNum = reader.ReadInt32();
                     var slots = readSlotInfo(reader, itfMethodToId, externTypes, maxId);
@@ -423,6 +428,7 @@ namespace IFix.Core
                     {
                         CtorId = ctorId,
                         FieldNum = fieldNum,
+                        FieldTypes = fieldTypes,
                         CtorParamNum = ctorParamNum,
                         Slots = slots
                     };
@@ -531,6 +537,17 @@ namespace IFix.Core
                     {
                         wrapperManager.InitWrapperArray(0);
                     };
+                }
+
+                int newClassCount = reader.ReadInt32();
+                for(int i = 0;i < newClassCount;i++)
+                {
+                    var newClassFullName = reader.ReadString();
+                    var newClassName = Type.GetType(newClassFullName);
+                    if (newClassName != null)
+                    {
+                        throw new Exception(newClassName + " class is expected to be a new class , but it already exists ");
+                    }
                 }
 
                 return virtualMachine;
