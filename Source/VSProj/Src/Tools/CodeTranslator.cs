@@ -42,6 +42,7 @@ namespace IFix
         private List<FieldDefinition> fieldsStoreInVirtualMachine = new List<FieldDefinition>();
         private Dictionary<FieldReference, int> fieldToId = new Dictionary<FieldReference, int>();
 
+        private Dictionary<MethodReference, int> virtualMethodToIndex = new Dictionary<MethodReference, int>();
         const string Wrap_Perfix = "__Gen_Wrap_";
 
         int nextAllocId = 0;
@@ -100,7 +101,7 @@ namespace IFix
             return td != null
                 && !td.IsInterface
                 && isNewClass(td)
-                && td.BaseType.IsSameType(objType);
+                && (td.BaseType.IsSameType(objType) || isCustomClassPlainObject(td.BaseType as TypeReference));
         }
 
         bool isCompilerGeneratedByNotPlainObject(TypeReference type)
@@ -137,7 +138,7 @@ namespace IFix
                     var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
                     if (cctor != null)
                     {
-                        var cctorInfo = getMethodId(cctor, null, false, InjectType.Redirect);
+                        var cctorInfo = getMethodId(cctor, null,false, false, InjectType.Redirect);
                         typeToCctor[type] = cctorInfo.Type == CallType.Internal ? cctorInfo.Id : -2;
                     }
                 }
@@ -262,6 +263,15 @@ namespace IFix
                 return ushort.MaxValue;
             }
 
+            if (callee.Name == "AwaitUnsafeOnCompleted")
+            {
+                
+                if (!awaitUnsafeOnCompletedMethods.Any(m => ((GenericInstanceMethod)callee).GenericArguments[0] == ((GenericInstanceMethod)m).GenericArguments[0]))
+                {
+                    awaitUnsafeOnCompletedMethods.Add(callee);
+                }
+            }
+
             if (externMethodToId.ContainsKey(callee))
             {
                 return externMethodToId[callee];
@@ -282,7 +292,11 @@ namespace IFix
             {
                 foreach (var typeArg in ((GenericInstanceMethod)callee).GenericArguments)
                 {
-                    addExternType(typeArg);
+                    if (!isCompilerGenerated(typeArg))
+                    {
+                        addExternType(typeArg);
+                    }
+                   
                 }
             }
 
@@ -580,7 +594,7 @@ namespace IFix
 
         void processMethod(MethodDefinition method)
         {
-            getMethodId(method, null);
+            getMethodId(method, null,true);
         }
 
         Core.ExceptionHandler findExceptionHandler(Core.ExceptionHandler[] ehs, Core.ExceptionHandlerType type,
@@ -618,11 +632,11 @@ namespace IFix
             return ret;
         }
 
-        MethodDefinition findOverride(TypeDefinition type, MethodReference vmethod)
+        MethodDefinition findOverride(TypeDefinition type, MethodReference vmethod, bool allowAbstractMethod = false)
         {
             foreach (var method in type.Methods)
             {
-                if (method.IsVirtual && !method.IsAbstract && isTheSameDeclare(method, vmethod))
+                if (method.IsVirtual && (allowAbstractMethod || !method.IsAbstract) && isTheSameDeclare(method, vmethod))
                 {
                     return method;
                 }
@@ -673,6 +687,58 @@ namespace IFix
             return _findBase(td.BaseType, method);
         }
 
+        MethodReference _findInitDefineVirtualMethod(TypeReference type, MethodDefinition method)
+        {
+            TypeDefinition td = type.Resolve();
+            if (td == null)
+            {
+                return null;
+            }
+            MethodReference baseM = null;
+            if (td.BaseType != null && isNewClass(td.BaseType as TypeDefinition))
+            {
+                baseM = _findInitDefineVirtualMethod(td.BaseType, method);
+            }
+            if (baseM != null)
+            {
+                return baseM;
+            }
+
+            var m = findOverride(td, method, true);
+            if (m != null)
+            {
+                if (type.IsGenericInstance)
+                {
+                    return m.MakeGeneric(method.DeclaringType);
+                }
+                else
+                {
+                    return m.TryImport(method.DeclaringType.Module);
+                }
+            }
+            return null;
+        }
+
+        MethodReference findInitDefineVirtualMethod(TypeDefinition type, MethodDefinition method)
+        {
+            if (method.IsVirtual) 
+            {
+                foreach (var objVirtualMethod in ObjectVirtualMethodDefinitionList)
+                {
+                    if (isTheSameDeclare(objVirtualMethod,method))
+                    {
+                        return objVirtualMethod;
+                    }
+                }
+                if (method.IsNewSlot)
+                {
+                    return method;
+                }
+                return _findInitDefineVirtualMethod(type.BaseType, method);
+            }
+            return null;
+        }
+
         MethodReference findBase(TypeDefinition type, MethodDefinition method)
         {
             if (method.IsVirtual && !method.IsNewSlot) //表明override
@@ -693,34 +759,41 @@ namespace IFix
         //var method = typeof(object).GetMethod("ToString");
         //var ftn = method.MethodHandle.GetFunctionPointer();
         //var func = (Func<string>)Activator.CreateInstance(typeof(Func<string>), obj, ftn);
-        MethodDefinition tryAddBaseProxy(TypeDefinition type, MethodDefinition method)
+        MethodReference tryAddBaseProxy(TypeDefinition type, MethodDefinition method)
         {
             var mbase = findBase(type, method);
             if (mbase != null)
             {
-                var proxyMethod = new MethodDefinition(BASE_RPOXY_PERFIX + method.Name, MethodAttributes.Private,
-                    method.ReturnType);
-                for(int i = 0; i < method.Parameters.Count; i++)
+                if (!isNewClass(type))
                 {
-                    proxyMethod.Parameters.Add(new ParameterDefinition("P" + i, method.Parameters[i].IsOut
-                        ? ParameterAttributes.Out : ParameterAttributes.None, method.Parameters[i].ParameterType));
-                }
-                var instructions = proxyMethod.Body.Instructions;
-                var ilProcessor = proxyMethod.Body.GetILProcessor();
-                int paramCount = method.Parameters.Count + 1;
-                for(int i = 0; i < paramCount; i++)
-                {
-                    emitLdarg(instructions, ilProcessor, i);
-                    if (i == 0 && type.IsValueType)
+                    var proxyMethod = new MethodDefinition(BASE_RPOXY_PERFIX + method.Name, MethodAttributes.Private,
+                                       method.ReturnType);
+                    for (int i = 0; i < method.Parameters.Count; i++)
                     {
-                        instructions.Add(Instruction.Create(OpCodes.Ldobj, type));
-                        instructions.Add(Instruction.Create(OpCodes.Box, type));
+                        proxyMethod.Parameters.Add(new ParameterDefinition("P" + i, method.Parameters[i].IsOut
+                            ? ParameterAttributes.Out : ParameterAttributes.None, method.Parameters[i].ParameterType));
                     }
+                    var instructions = proxyMethod.Body.Instructions;
+                    var ilProcessor = proxyMethod.Body.GetILProcessor();
+                    int paramCount = method.Parameters.Count + 1;
+                    for (int i = 0; i < paramCount; i++)
+                    {
+                        emitLdarg(instructions, ilProcessor, i);
+                        if (i == 0 && type.IsValueType)
+                        {
+                            instructions.Add(Instruction.Create(OpCodes.Ldobj, type));
+                            instructions.Add(Instruction.Create(OpCodes.Box, type));
+                        }
+                    }
+                    instructions.Add(Instruction.Create(OpCodes.Call, mbase));
+                    instructions.Add(Instruction.Create(OpCodes.Ret));
+                    type.Methods.Add(proxyMethod);
+                    return proxyMethod;
                 }
-                instructions.Add(Instruction.Create(OpCodes.Call, mbase));
-                instructions.Add(Instruction.Create(OpCodes.Ret));
-                type.Methods.Add(proxyMethod);
-                return proxyMethod;
+                else if(isNewClass(type) && !isNewClass(type.BaseType as TypeDefinition))
+                {
+                    return objectVirtualMethodReferenceList.FirstOrDefault( m => m.Name == ("Object" + method.Name));
+                }
             }
             return null;
         }
@@ -729,6 +802,7 @@ namespace IFix
         {
             Extern,
             Internal,
+            InteralVirtual,
             Invalid
         }
 
@@ -951,7 +1025,7 @@ namespace IFix
         /// <param name="callerInjectType">调用者的注入类型</param>
         /// <returns>负数表示需要反射访问原生，0或正数是指令数组下标</returns>
         // #lizard forgives
-        unsafe MethodIdInfo getMethodId(MethodReference callee, MethodDefinition caller,
+        unsafe MethodIdInfo getMethodId(MethodReference callee, MethodDefinition caller, bool isCallvirt,
             bool directCallVirtual = false, InjectType callerInjectType = InjectType.Switch)
         {
             //Console.WriteLine("callee:" + callee + ", caller:" + caller);
@@ -965,9 +1039,35 @@ namespace IFix
                     Type = CallType.Extern
                 };
             }
+            if (method != null)
+            {
+                if (method.IsAbstract && isCallvirt)
+                {
+                    if (isCompilerGeneratedPlainObject(method.DeclaringType) || isCustomClassPlainObject(method.DeclaringType))
+                    {
+                        return new MethodIdInfo()
+                        {
+                            Id = virtualMethodInVTableIndex(method),
+                            Type = CallType.InteralVirtual
+                        };
+                    }
+                }
 
+            }
             if (methodToId.ContainsKey(callee))
             {
+                if (isCallvirt)
+                {
+                    getVirtualMethodForType(method.DeclaringType);
+                    if (virtualMethodToIndex.ContainsKey(callee))
+                    {
+                        return new MethodIdInfo()
+                        {
+                            Id = virtualMethodToIndex[callee],
+                            Type = CallType.InteralVirtual
+                        };
+                    }
+                }
                 return new MethodIdInfo()
                 {
                     Id = methodToId[callee],
@@ -1007,9 +1107,8 @@ namespace IFix
             {
                 return new MethodIdInfo() { Id = 0, Type = CallType.Invalid };
             }
-
+           
             var baseProxy = tryAddBaseProxy(method.DeclaringType, method);
-
             var body = method.Body;
             var msIls = body.Instructions;
             var ilOffset = new Dictionary<Instruction, int>();
@@ -1087,17 +1186,32 @@ namespace IFix
                 {
                     if (variable.VariableType.IsValueType && !variable.VariableType.IsPrimitive)
                     {
-                        code.Add(new Core.Instruction
+                        if (isCompilerGenerated(variable.VariableType))
                         {
-                            Code = Core.Code.Ldloca,
-                            Operand = variable.Index,
-                        });
-
-                        code.Add(new Core.Instruction
+                            code.Add(new Core.Instruction
+                            {
+                                Code = Core.Code.Newanon,
+                                Operand = addAnonymousCtor(null, variable.VariableType)
+                            });
+                            code.Add(new Core.Instruction
+                            {
+                                Code = Core.Code.Stloc,
+                                Operand = variable.Index
+                            });
+                        }
+                        else
                         {
-                            Code = Core.Code.Initobj,
-                            Operand = addExternType(variable.VariableType)
-                        });
+                            code.Add(new Core.Instruction
+                            {
+                                Code = Core.Code.Ldloca,
+                                Operand = variable.Index,
+                            });
+                            code.Add(new Core.Instruction
+                            {
+                                Code = Core.Code.Initobj,
+                                Operand = addExternType(variable.VariableType)
+                            });
+                        }
                         offsetAdd += 2;
                     }
                 }
@@ -1414,7 +1528,7 @@ namespace IFix
                                     methodToCall.DeclaringType) || isCustomClassPlainObject(methodToCall.DeclaringType)))
                                 {
                                     TypeDefinition td = methodToCall.DeclaringType as TypeDefinition;
-                                    var anonymousCtorInfo = getMethodId(methodToCall, method, false, 
+                                    var anonymousCtorInfo = getMethodId(methodToCall, method, false, false,
                                         injectTypePassToNext);
                                     if (anonymousCtorInfo.Type != CallType.Internal)
                                     {
@@ -1461,15 +1575,15 @@ namespace IFix
                                 }
                                 int paramCount = (methodToCall.Parameters.Count + (msIl.OpCode.Code != Code.Newobj 
                                     && methodToCall.HasThis ? 1 : 0));
-                                var methodIdInfo = getMethodId(methodToCall, method, or != null || directCallVirtual,
+                                var methodIdInfo = getMethodId(methodToCall, method, msIl.OpCode.Code == Code.Callvirt, or != null || directCallVirtual,
                                     injectTypePassToNext);
 
                                 bool callingBaseMethod = false;
 
                                 try
                                 {
-                                    var callingType = methodToCall.DeclaringType;
-                                    var baseType = method.DeclaringType.BaseType;
+                                    var callingType = methodToCall.DeclaringType.Resolve();
+                                    TypeReference baseType = method.DeclaringType.BaseType.Resolve();
                                     while (baseType != null)
                                     {
                                         if (callingType.IsSameType(baseType))
@@ -1477,7 +1591,7 @@ namespace IFix
                                             callingBaseMethod = true;
                                             break;
                                         }
-                                        baseType = baseType.Resolve().BaseType;
+                                        baseType = baseType.Resolve().BaseType.Resolve();
                                     }
                                 }
                                 catch { }
@@ -1513,6 +1627,35 @@ namespace IFix
                                         Operand = (paramCount << 16) | methodIdInfo.Id
                                     });
                                 }
+                                else if (methodIdInfo.Type == CallType.InteralVirtual)
+                                {
+                                    if ((methodToCall as MethodDefinition).IsVirtual)
+                                    {
+                                        int idx = -1;
+                                        if(!virtualMethodToIndex.TryGetValue(methodToCall,out idx))
+                                        {
+                                            idx = virtualMethodInVTableIndex(methodToCall as MethodDefinition);
+                                        }
+                                        code.Add(new Core.Instruction
+                                        {
+                                            Code = Core.Code.Callvirtvirt,
+                                            Operand = (paramCount << 16) | idx
+                                        });
+                                    }
+                                    else
+                                    {
+                                        code.Add(new Core.Instruction
+                                        {
+                                            Code = (or != null) ? Core.Code.Call :
+                                            (Core.Code)Enum.Parse(typeof(Core.Code), strCode),
+                                            Operand = (paramCount << 16) | methodToId[method]
+                                        });
+                                        if (msIl.OpCode.Code == Code.Newobj)
+                                        {
+                                            throw new InvalidProgramException("Newobj's Operand is not a constructor?");
+                                        }
+                                    }
+                                }
                                 else
                                 {
                                     throw new InvalidProgramException("call a generic method definition");
@@ -1523,10 +1666,25 @@ namespace IFix
                         case Code.Ldvirtftn:
                             {
                                 var methodToCall = msIl.Operand as MethodReference;
-                                var methodIdInfo = getMethodId(methodToCall, method, false, injectTypePassToNext);
+                                var methodIdInfo = getMethodId(methodToCall, method, msIl.OpCode.Code == Code.Ldvirtftn, false, injectTypePassToNext);
                                 if (methodIdInfo.Type == CallType.Internal
                                     && (isCompilerGeneratedPlainObject(methodToCall.DeclaringType) || isCustomClassPlainObject(methodToCall.DeclaringType))) // closure
                                 {
+                                    if ((methodToCall as MethodDefinition).IsVirtual)
+                                    {
+                                        int methodIndex = -1;
+                                        if (!virtualMethodToIndex.TryGetValue(methodToCall,out methodIndex))
+                                        {
+                                            methodIndex = virtualMethodInVTableIndex(methodToCall as MethodDefinition);
+                                        }
+                                        code.Add(new Core.Instruction
+                                        {
+                                            Code = Core.Code.Ldvirtftn2,
+                                            Operand = methodIndex
+                                        });
+                                        break;
+
+                                    }
                                     //Console.WriteLine("closure: " + methodToCall);
                                     getWrapperMethod(wrapperType, anonObjOfWrapper, methodToCall as MethodDefinition,
                                         true, true);
@@ -1608,13 +1766,20 @@ namespace IFix
                         case Code.Ldflda:
                             {
                                 var field = msIl.Operand as FieldReference;
-                                if (isCompilerGeneratedPlainObject(field.DeclaringType) || isCustomClassPlainObject(field.DeclaringType))
+                                if (isCompilerGenerated(field.DeclaringType) || isCompilerGeneratedPlainObject(field.DeclaringType) || isCustomClassPlainObject(field.DeclaringType))
                                 {
                                     var declaringType = field.DeclaringType as TypeDefinition;
+                                    int baseFieldCount = 0;
+                                    var temp = declaringType;
+                                    while (temp.BaseType != null && isNewClass(temp.BaseType as TypeDefinition))
+                                    {
+                                        baseFieldCount += (temp.BaseType as TypeDefinition).Fields.Count;
+                                        temp = temp.BaseType as TypeDefinition;
+                                    }
                                     code.Add(new Core.Instruction
                                     {
                                         Code = (Core.Code)Enum.Parse(typeof(Core.Code), strCode),
-                                        Operand = -(declaringType.Fields.IndexOf(field as FieldDefinition) + 1)
+                                        Operand = -(declaringType.Fields.IndexOf(field as FieldDefinition) + baseFieldCount + 1)
                                     });
                                     //Console.WriteLine("anon obj field:" + field + ",idx:" +
                                     //    declaringType.Fields.IndexOf(field as FieldDefinition));
@@ -1745,13 +1910,24 @@ namespace IFix
                 injectMethod(method, methodId);
             }
 
-            if (!directCallVirtual && method.IsVirtual)
+            if (!directCallVirtual && method.IsVirtual && isCallvirt)
             {
-                return new MethodIdInfo()
+                if (isNewClass(method.DeclaringType))
                 {
-                    Id = addExternMethod(callee, caller),
-                    Type = CallType.Extern
-                };
+                    return new MethodIdInfo()
+                    {
+                        Id = virtualMethodInVTableIndex(method),
+                        Type = CallType.InteralVirtual
+                    };
+                }
+                else
+                {
+                    return new MethodIdInfo()
+                    {
+                        Id = addExternMethod(callee, caller),
+                        Type = CallType.Extern
+                    };
+                }
             }
             else
             {
@@ -1783,7 +1959,7 @@ namespace IFix
         private MethodReference anonymousStoreyCtorRef;
 
         private FieldDefinition virualMachineFieldOfWrapper;
-        private FieldDefinition virualMachineFieldOfBridge;
+        private FieldReference virualMachineFieldOfBridge;
         private FieldDefinition methodIdFieldOfWrapper;
         private FieldDefinition anonObjOfWrapper;
         private FieldDefinition wrapperArray;
@@ -1827,18 +2003,7 @@ namespace IFix
             }
             if (type.IsValueType)
             {
-                if (type.IsPrimitive)
-                {
-                    return type;
-                }
-                try
-                {
-                    if (type.Resolve().IsEnum)
-                    {
-                        return type;
-                    }
-                }
-                catch { }
+                return type;
             }
             return objType;
         }
@@ -1851,21 +2016,42 @@ namespace IFix
         private List<MethodDefinition> anonymousTypeInfos = new List<MethodDefinition>();
         private Dictionary<MethodDefinition, int> anonymousTypeToId = new Dictionary<MethodDefinition, int>();
 
-        int addAnonymousCtor(MethodDefinition ctor)
+        int addAnonymousCtor(MethodDefinition ctor, TypeReference variableType = null)
         {
             int id;
-            if (anonymousTypeToId.TryGetValue(ctor, out id))
+            var ctorOrMethod = ctor != null ? ctor : (variableType as TypeDefinition).Methods[0];
+            if (anonymousTypeToId.TryGetValue(ctorOrMethod, out id))
             {
                 return id;
             }
-            addInterfacesOfTypeToBridge(ctor.DeclaringType as TypeDefinition);
-            foreach(var method in ctor.DeclaringType.Methods.Where(m => !m.IsConstructor))
+            var typeDefinition = ctor != null ? (ctor.DeclaringType as TypeDefinition) : (variableType as TypeDefinition);
+            addInterfacesOfTypeToBridge(typeDefinition);
+            var methods = typeDefinition.Methods.Where(m => !m.IsConstructor).ToList();
+            if(variableType != null || ctor.DeclaringType.Fields.Count > 0)
             {
-                getMethodId(method, null, true, InjectType.Redirect);
+                for (int field = 0; field < typeDefinition.Fields.Count; field++)
+                {
+                    if (typeDefinition.Fields[field].FieldType.IsValueType)
+                    {
+                        if (!isCompilerGenerated(typeDefinition.Fields[field].FieldType))
+                        {
+                            if (!externTypes.Contains(typeDefinition.Fields[field].FieldType))
+                            {
+                                addExternType(typeDefinition.Fields[field].FieldType);
+                            }
+                        }
+                    }
+                }
+            }
+
+            foreach (var method in methods)
+            {
+                getMethodId(method, null,true, true, InjectType.Redirect);
             }
             id = anonymousTypeInfos.Count;
-            anonymousTypeInfos.Add(ctor);
-            anonymousTypeToId[ctor] = id;
+            var methodDefinition = ctor != null ? ctor : methods[0];
+            anonymousTypeInfos.Add(methodDefinition);
+            anonymousTypeToId[methodDefinition] = id;
             return id;
         }
 
@@ -1917,7 +2103,7 @@ namespace IFix
                     }
                     
                     //implementMap[method] = matchItfMethod;
-                    if (itfBridgeType.Interfaces.Any(ii => ii.InterfaceType.IsSameType(matchItfMethod.DeclaringType)))
+                    if (matchItfMethod == null || itfBridgeType.Interfaces.Any(ii => ii.InterfaceType.IsSameType(matchItfMethod.DeclaringType)))
                     {
                         continue;
                     }
@@ -1927,17 +2113,16 @@ namespace IFix
                     continue;
                 }
 
-                if (matchItfMethod == null)
+                if (matchItfMethod != null)
                 {
-                    throw new Exception("can not find base method for " + method);
+                    toImplement.Add(matchItfMethod.DeclaringType);
+                    //Console.WriteLine("add slot " + matchItfMethod + ",m=" + method);
+                    interfaceSlot.Add(matchItfMethod, bridgeMethodId);
+                    var impl = getWrapperMethod(itfBridgeType, null, method, false, true, true, bridgeMethodId);
+                    addIDTag(impl, bridgeMethodId++);
+                    impl.Overrides.Add(matchItfMethod);
                 }
 
-                toImplement.Add(matchItfMethod.DeclaringType);
-                //Console.WriteLine("add slot " + matchItfMethod + ",m=" + method);
-                interfaceSlot.Add(matchItfMethod, bridgeMethodId);
-                var impl = getWrapperMethod(itfBridgeType, null, method, false, true, true, bridgeMethodId);
-                addIDTag(impl, bridgeMethodId++);
-                impl.Overrides.Add(matchItfMethod);
             }
 
             //Console.WriteLine("end type:" + anonType);
@@ -1985,6 +2170,29 @@ namespace IFix
                 addInterfaceToBridge(ii.InterfaceType.FillGenericArgument(null, itf).TryImport(itf.Module));
             }
         }
+
+        void EmitRefAwaitUnsafeOnCompletedMethod()
+        {
+            MethodDefinition targetMethod = new MethodDefinition("RefAwaitUnsafeOnCompleteMethod",
+                Mono.Cecil.MethodAttributes.Public, assembly.MainModule.TypeSystem.Void);
+            var instructions = targetMethod.Body.Instructions;
+            var localBridge = new VariableDefinition(itfBridgeType);
+            targetMethod.Body.Variables.Add(localBridge);
+            for (int j = 0;j < awaitUnsafeOnCompletedMethods.Count;j++)
+            {
+                var localTaskAwaiter = new VariableDefinition(((GenericInstanceMethod)awaitUnsafeOnCompletedMethods[j]).GenericArguments[0]);
+                targetMethod.Body.Variables.Add(localTaskAwaiter);
+                var localAsync = new VariableDefinition(awaitUnsafeOnCompletedMethods[j].DeclaringType);
+                targetMethod.Body.Variables.Add(localAsync);
+                instructions.Add(Instruction.Create(OpCodes.Ldloca_S, localAsync));
+                instructions.Add(Instruction.Create(OpCodes.Ldloca_S, localTaskAwaiter));
+                instructions.Add(Instruction.Create(OpCodes.Ldloca_S, localBridge));
+                instructions.Add(Instruction.Create(OpCodes.Call, makeGenericMethod(awaitUnsafeOnCompletedMethods[j].GetElementMethod(), ((GenericInstanceMethod)awaitUnsafeOnCompletedMethods[j]).GenericArguments[0], itfBridgeType)));
+            }
+            instructions.Add(Instruction.Create(OpCodes.Ret));
+            itfBridgeType.Methods.Add(targetMethod);
+        }
+
 
         /// <summary>
         /// 获取一个方法的适配器
@@ -2133,6 +2341,7 @@ namespace IFix
                             instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
                             MethodReference push;
                             var wpt = wrapperParamerterType(paramRawType);
+                            wpt = (wpt.IsValueType && !wpt.IsPrimitive) ? objType : wpt;
                             if (pushMap.TryGetValue(wpt, out push))
                             {
                                 if (wpt == assembly.MainModule.TypeSystem.Object)
@@ -2312,9 +2521,9 @@ namespace IFix
                         instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
 
                         emitLdcI4(instructions, refPos[i]);
-                        if (getMap.ContainsKey(paramRawType))
+                        if (paramRawType.IsPrimitive && getMap.ContainsKey(paramRawType.Resolve()))
                         {
-                            instructions.Add(Instruction.Create(OpCodes.Callvirt, getMap[paramRawType]));
+                            instructions.Add(Instruction.Create(OpCodes.Callvirt, getMap[paramRawType.Resolve()]));
                         }
                         else
                         {
@@ -2331,7 +2540,8 @@ namespace IFix
                 instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
                 MethodReference get;
                 emitLdcI4(instructions, refCount);
-                if (getMap.TryGetValue(tryGetUnderlyingType(returnType), out get))
+                var returnRawType = tryGetUnderlyingType(returnType);
+                if (returnRawType.IsPrimitive && getMap.TryGetValue(returnRawType.Resolve(), out get))
                 {
                     instructions.Add(Instruction.Create(OpCodes.Callvirt, get));
                 }
@@ -2396,6 +2606,7 @@ namespace IFix
         {
             try
             {
+                if (type.IsArray) return type;
                 TypeDefinition typeDefinition = type.Resolve();
                 if (typeDefinition.IsEnum)
                 {
@@ -2465,11 +2676,24 @@ namespace IFix
             OpCodes.Ldc_I4_3,OpCodes.Ldc_I4_4, OpCodes.Ldc_I4_5, OpCodes.Ldc_I4_6, OpCodes.Ldc_I4_7 };
         private Dictionary<TypeReference, OpCode> ldinds = null;
         private Dictionary<TypeReference, OpCode> stinds = null;
+        private List<MethodDefinition> ObjectVirtualMethodDefinitionList = null;
+        private List<MethodReference> objectVirtualMethodReferenceList = null;
 
         void init(AssemblyDefinition assembly, AssemblyDefinition ilfixAassembly)
         {
             this.assembly = assembly;
             objType = assembly.MainModule.TypeSystem.Object;
+            List<string> supportedMethods = new List<string>() { "Equals", "Finalize","GetHashCode", "ToString"};
+            ObjectVirtualMethodDefinitionList = (from method in objType.Resolve().Methods where method.IsVirtual && supportedMethods.Contains(method.Name) select method).ToList();
+            if (ObjectVirtualMethodDefinitionList.Count != 4)
+            {
+                throw new InvalidProgramException();
+            }
+            ObjectVirtualMethodDefinitionList.OrderBy(t => t.FullName);
+            for (int methodIdx = 0; methodIdx < ObjectVirtualMethodDefinitionList.Count; methodIdx++)
+            {
+                virtualMethodToIndex.Add(ObjectVirtualMethodDefinitionList[methodIdx], methodIdx);
+            }
             voidType = assembly.MainModule.TypeSystem.Void;
 
             wrapperType = new TypeDefinition("IFix", DYNAMICWRAPPER, Mono.Cecil.TypeAttributes.Class
@@ -2533,14 +2757,16 @@ namespace IFix
             var anonymousStoreyType = ilfixAassembly.MainModule.Types.Single(t => t.Name == "AnonymousStorey");
             anonymousStoreyTypeRef = assembly.MainModule.ImportReference(anonymousStoreyType);
             anonymousStoreyCtorRef = assembly.MainModule.ImportReference(
-                anonymousStoreyType.Methods.Single(m => m.Name == ".ctor" && m.Parameters.Count == 2));
+                anonymousStoreyType.Methods.Single(m => m.Name == ".ctor" && m.Parameters.Count == 5));
+
+            objectVirtualMethodReferenceList = anonymousStoreyType.Methods.Where(m => m.Name.StartsWith("Object")).
+                Select(m => assembly.MainModule.ImportReference(m)).ToList();
 
             itfBridgeType = new TypeDefinition("IFix", INTERFACEBRIDGE, TypeAttributes.Class | TypeAttributes.Public,
                     anonymousStoreyTypeRef);
-            virualMachineFieldOfBridge = new FieldDefinition("virtualMachine", Mono.Cecil.FieldAttributes.Private,
-                    VirtualMachineType);
-            itfBridgeType.Fields.Add(virualMachineFieldOfBridge);
+            virualMachineFieldOfBridge = assembly.MainModule.ImportReference(anonymousStoreyType.Fields.Single(f => f.Name == "virtualMachine"));
             assembly.MainModule.Types.Add(itfBridgeType);
+            addExternType(itfBridgeType);
 
             //end init itfBridgeType
 
@@ -2641,7 +2867,7 @@ namespace IFix
         void initStackOp(TypeDefinition call, TypeReference type)
         {
             pushMap[type] = importMethodReference(call, "Push" + type.Name);
-            getMap[type] = importMethodReference(call, "Get" + type.Name);
+            getMap[type.Resolve()] = importMethodReference(call, "Get" + type.Name);
             nameToTypeReference[type.FullName] = type;
         }
 
@@ -2994,6 +3220,7 @@ namespace IFix
         bool hasRedirect = false;
         ProcessMode mode;
         GenerateConfigure configure;
+        List<MethodReference> awaitUnsafeOnCompletedMethods = new List<MethodReference>();
 
         public ProcessResult Process(AssemblyDefinition assembly, AssemblyDefinition ilfixAassembly,
             GenerateConfigure configure, ProcessMode mode)
@@ -3020,7 +3247,7 @@ namespace IFix
                 from type in allTypes
                 where !(isCompilerGenerated(type) || isNewClass(type)) && !type.HasGenericParameters
                 from method in type.Methods
-                where !method.IsConstructor && !isCompilerGenerated(method) && !method.HasGenericParameters
+                where !method.IsConstructor && !isCompilerGenerated(method) && !method.HasGenericParameters && !method.ReturnType.IsRequiredModifier
                 select method))
             {
                 int flag;
@@ -3049,7 +3276,11 @@ namespace IFix
             if (mode == ProcessMode.Inject)
             {
                 redirectFieldRename();
-            }
+                if (awaitUnsafeOnCompletedMethods.Count != 0)
+                {
+                    EmitRefAwaitUnsafeOnCompletedMethod();
+                }
+            } 
 
             return ProcessResult.OK;
         }
@@ -3078,7 +3309,7 @@ namespace IFix
 
                     if (!name.StartsWith("get_") && !name.StartsWith("set_"))
                     {
-                        throw new NotImplementedException("do not support special method: " + m);
+                        continue;
                     }
 
                     var propName = name.Substring(4);
@@ -3124,6 +3355,10 @@ namespace IFix
                 Mono.Cecil.ParameterAttributes.None, assembly.MainModule.TypeSystem.Int32));
             ctorOfItfBridgeType.Parameters.Add(new ParameterDefinition("fieldTypes",
                 Mono.Cecil.ParameterAttributes.None, new ArrayType(assembly.MainModule.TypeSystem.Int32)));
+            ctorOfItfBridgeType.Parameters.Add(new ParameterDefinition("typeIndex",
+                Mono.Cecil.ParameterAttributes.None, assembly.MainModule.TypeSystem.Int32));
+            ctorOfItfBridgeType.Parameters.Add(new ParameterDefinition("vTable",
+                Mono.Cecil.ParameterAttributes.None, new ArrayType(assembly.MainModule.TypeSystem.Int32)));
             ctorOfItfBridgeType.Parameters.Add(new ParameterDefinition("methodIdArray",
                 Mono.Cecil.ParameterAttributes.None, new ArrayType(assembly.MainModule.TypeSystem.Int32)));
             ctorOfItfBridgeType.Parameters.Add(new ParameterDefinition("virtualMachine",
@@ -3132,17 +3367,16 @@ namespace IFix
             instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
             instructions.Add(Instruction.Create(OpCodes.Ldarg_1));
             instructions.Add(Instruction.Create(OpCodes.Ldarg_2));
+            instructions.Add(Instruction.Create(OpCodes.Ldarg_3));
+            instructions.Add(createLdarg(ctorOfItfBridgeType.Body.GetILProcessor(), 4));
+            instructions.Add(createLdarg(ctorOfItfBridgeType.Body.GetILProcessor(), 6));
             var callBaseCtor = Instruction.Create(OpCodes.Call, anonymousStoreyCtorRef);
             instructions.Add(callBaseCtor);
-
-            instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
-            instructions.Add(createLdarg(ctorOfItfBridgeType.Body.GetILProcessor(), 4));
-            instructions.Add(Instruction.Create(OpCodes.Stfld, virualMachineFieldOfBridge));
 
             for (int i = 0; i < methodIdFields.Count; i++)
             {
                 instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
-                instructions.Add(Instruction.Create(OpCodes.Ldarg_3));
+                instructions.Add(createLdarg(ctorOfItfBridgeType.Body.GetILProcessor(), 5));
                 emitLdcI4(instructions, i);
                 instructions.Add(Instruction.Create(OpCodes.Ldelem_I4));
                 instructions.Add(Instruction.Create(OpCodes.Stfld, methodIdFields[i]));
@@ -3152,7 +3386,7 @@ namespace IFix
 
             var insertPoint = callBaseCtor.Next;
             var processor = ctorOfItfBridgeType.Body.GetILProcessor();
-            processor.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldarg_3));
+            processor.InsertBefore(insertPoint, createLdarg(ctorOfItfBridgeType.Body.GetILProcessor(), 5));
             processor.InsertBefore(insertPoint, Instruction.Create(OpCodes.Ldlen));
             processor.InsertBefore(insertPoint, Instruction.Create(OpCodes.Conv_I4));
             processor.InsertBefore(insertPoint, createLdcI4(methodIdFields.Count));
@@ -3175,6 +3409,10 @@ namespace IFix
                 assembly.MainModule.TypeSystem.Int32));
             createBridge.Parameters.Add(new ParameterDefinition("fieldTypes", Mono.Cecil.ParameterAttributes.None,
                 new ArrayType(assembly.MainModule.TypeSystem.Int32)));
+            createBridge.Parameters.Add(new ParameterDefinition("typeIndex", Mono.Cecil.ParameterAttributes.None,
+                assembly.MainModule.TypeSystem.Int32));
+            createBridge.Parameters.Add(new ParameterDefinition("vTable", Mono.Cecil.ParameterAttributes.None,
+                new ArrayType(assembly.MainModule.TypeSystem.Int32)));
             createBridge.Parameters.Add(new ParameterDefinition("slots", Mono.Cecil.ParameterAttributes.None,
                 new ArrayType(assembly.MainModule.TypeSystem.Int32)));
             createBridge.Parameters.Add(new ParameterDefinition("virtualMachine", Mono.Cecil.ParameterAttributes.None,
@@ -3184,6 +3422,8 @@ namespace IFix
             instructions.Add(Instruction.Create(OpCodes.Ldarg_2));
             instructions.Add(Instruction.Create(OpCodes.Ldarg_3));
             instructions.Add(createLdarg(createBridge.Body.GetILProcessor(), 4));
+            instructions.Add(createLdarg(createBridge.Body.GetILProcessor(), 5));
+            instructions.Add(createLdarg(createBridge.Body.GetILProcessor(), 6));
             instructions.Add(Instruction.Create(OpCodes.Newobj, ctorOfItfBridgeType));
             instructions.Add(Instruction.Create(OpCodes.Ret));
 
@@ -3235,9 +3475,13 @@ namespace IFix
                 writer.Write(method.Name);
                 var typeArgs = ((GenericInstanceMethod)method).GenericArguments;
                 writer.Write(typeArgs.Count);
-                foreach (var typeArg in typeArgs)
+                for (int typeArg = 0;typeArg < typeArgs.Count;typeArg++)
                 {
-                    writer.Write(externTypeToId[typeArg]);
+                    if (isCompilerGenerated(typeArgs[typeArg]))
+                    {
+                        typeArgs[typeArg] = itfBridgeType;
+                    }
+                    writer.Write(externTypeToId[typeArgs[typeArg]]);
                 }
                 writer.Write(method.Parameters.Count);
                 //var genericParameters = ((GenericInstanceMethod)externMethod).ElementMethod.GenericParameters;
@@ -3478,25 +3722,59 @@ namespace IFix
                 {
                     //Console.WriteLine("anonymous type: " + anonymousTypeInfos[i]);
                     var anonymousType = anonymousTypeInfos[i].DeclaringType as TypeDefinition;
-                    writer.Write(anonymousType.Fields.Count);
-                    for (int fieldIdx = 0; fieldIdx < anonymousType.Fields.Count; ++fieldIdx)
+                    List<FieldDefinition> anonymousTypeFields = new List<FieldDefinition>();
+                    if (isNewClass(anonymousTypeInfos[i].DeclaringType as TypeDefinition))
                     {
-                        if (anonymousType.Fields[fieldIdx].FieldType.IsPrimitive)
+                        var temp = anonymousType;
+                        while (temp != null && isNewClass(temp as TypeDefinition))
+                        {
+                            if (temp.Fields != null)
+                            {
+                                foreach (var fi in temp.Fields)
+                                {
+                                    anonymousTypeFields.Add(fi);
+                                }
+                            }
+                            temp = temp.BaseType as TypeDefinition;
+                        }
+                    }
+                    else
+                    {
+                        anonymousTypeFields.AddRange(anonymousTypeInfos[i].DeclaringType.Fields);
+                    }
+                    writer.Write(anonymousTypeFields.Count);
+
+                    for (int field = 0; field < anonymousTypeFields.Count; field++)
+                    {
+                        if (anonymousTypeFields[field].FieldType.IsPrimitive)
                         {
                             writer.Write(0);
                         }
-                        else if (anonymousType.Fields[fieldIdx].FieldType.IsValueType)
+                        else if (anonymousTypeFields[field].FieldType.IsValueType)
                         {
-                            writer.Write(1);
+                            writer.Write(externTypeToId[anonymousTypeFields[field].FieldType] + 1);
                         }
                         else
                         {
-                            writer.Write(2);
+                            writer.Write(-2);
                         }
                     }
                     writer.Write(methodToId[anonymousTypeInfos[i]]);
                     writer.Write(anonymousTypeInfos[i].Parameters.Count);
                     writeSlotInfo(writer, anonymousType);
+                    List<MethodDefinition> vT = getVirtualMethodForType(anonymousType);
+                    writer.Write(vT.Count);
+                    int[] vTables = new int[vT.Count];
+                    for (int s = 0; s < vTables.Length; s++)
+                    {
+                        vTables[s] = -1;
+                    }
+                    writeVTable(anonymousType,vTables,vT);
+
+                    for (int k = 0; k < vTables.Length; k++)
+                    {
+                        writer.Write(vTables[k]);
+                    }
                 }
 
                 writer.Write(wrapperMgrImpl.GetAssemblyQualifiedName());
@@ -3553,6 +3831,75 @@ namespace IFix
             //{
             //    Console.WriteLine("hgp:" + method + ",type:" + method.GetType());
             //}
+        }
+        Dictionary<TypeDefinition, List<MethodDefinition>> InternalTypeToVirtualMethods = new Dictionary<TypeDefinition, List<MethodDefinition>>();
+        public List<MethodDefinition> getVirtualMethodForType(TypeDefinition type)
+        {
+            List<MethodDefinition> virtualMethods;
+            if (InternalTypeToVirtualMethods.TryGetValue(type, out virtualMethods))
+            {
+                return virtualMethods;
+            }
+
+            if (type.BaseType != null && isNewClass(type.BaseType as TypeDefinition))
+            {
+                virtualMethods = new List<MethodDefinition>(getVirtualMethodForType(type.BaseType as TypeDefinition));
+            }
+            else
+            {
+                virtualMethods = new List<MethodDefinition>(ObjectVirtualMethodDefinitionList);
+            }
+            int index = virtualMethods.Count;
+            foreach (var method in type.Methods)
+            {
+                if (method.IsVirtual && method.IsNewSlot)
+                {
+                    virtualMethods.Add(method);
+                }
+            }
+
+            InternalTypeToVirtualMethods.Add(type, virtualMethods);
+            foreach (var vmethod in virtualMethods)
+            {
+                if (!virtualMethodToIndex.ContainsKey(vmethod))
+                {
+                    virtualMethodToIndex.Add(vmethod, index++);
+                }
+            }
+            return virtualMethods;
+        }
+
+        public int virtualMethodInVTableIndex(MethodDefinition method)
+        {
+            var list = getVirtualMethodForType(method.DeclaringType);
+            var baseMethod = findInitDefineVirtualMethod(method.DeclaringType as TypeDefinition, method);
+            return list.FindIndex(li => li == baseMethod || li == method);
+        }
+
+        public void writeVTable(TypeDefinition type,int[] vTables,List<MethodDefinition> vT)
+        {
+            if (type.BaseType != null && isNewClass(type.BaseType as TypeDefinition))
+            {
+                writeVTable(type.BaseType as TypeDefinition, vTables,vT);
+            }
+            foreach (var an in (from method in type.Methods
+                                where method.IsVirtual
+                                where !method.IsAbstract
+                                select method))
+            {
+                int index = 0;
+                if (!virtualMethodToIndex.TryGetValue(an,out index))
+                {
+                    index = virtualMethodInVTableIndex(an);
+                }
+                if (!methodToId.ContainsKey(an))
+                {
+                    vTables[index] = getMethodId(an, null, false).Id;
+                }
+                else
+                    vTables[index] = methodToId[an];
+            }
+            
         }
     }
 

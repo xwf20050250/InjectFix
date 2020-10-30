@@ -633,6 +633,40 @@ namespace IFix.Core
                                 //printStack("ret", evaluationStackPointer - 1);
                             }
                             break;
+
+                        case Code.Callvirtvirt:
+                            {
+                                int narg = pc->Operand >> 16;
+                                var arg0 = evaluationStackPointer - narg;
+                                if (arg0->Type != ValueType.Object)
+                                {
+                                    throwRuntimeException(new InvalidProgramException(arg0->Type.ToString()
+                                        + " for Callvirtvirt"), true);
+                                }
+                                if (managedStack[arg0->Value1] == null)
+                                {
+                                    throw new NullReferenceException("this is null");
+                                }
+                                var anonObj =  managedStack[arg0->Value1] as AnonymousStorey;
+                                int[] vTable = anonymousStoreyInfos[anonObj.typeId].VTable;
+                                int methodIndexToCall = vTable[pc->Operand & 0xFFFF];
+                                evaluationStackPointer = Execute(unmanagedCodes[methodIndexToCall],
+                                    evaluationStackPointer - narg, managedStack, evaluationStackBase,
+                                    narg, methodIndexToCall);
+                            }
+                            break;
+
+                        case Code.Ldvirtftn2:
+                            {
+                                int slot = pc->Operand & 0xFFFF;
+                                var pm = evaluationStackPointer - 1;
+                                var po = pm - 1;
+                                var anonObj = managedStack[po->Value1] as AnonymousStorey;
+                                pm->Value1 = anonymousStoreyInfos[anonObj.typeId].VTable[slot];
+                                pm->Type = ValueType.Integer;
+                            }
+                            break;
+
                         case Code.CallExtern://部分来自Call部分来自Callvirt
                         case Code.Newobj: // 2.334642%
                             int methodId = pc->Operand & 0xFFFF;
@@ -911,7 +945,9 @@ namespace IFix.Core
                                 else
                                 {
                                     fieldIndex = -(fieldIndex + 1);
-                                    AnonymousStorey anonyObj = managedStack[ptr->Value1] as AnonymousStorey;
+                                    object obj = EvaluationStackOperation.ToObject(evaluationStackBase, ptr,
+                                       managedStack, ptr->Type.GetType(), this, false);
+                                    AnonymousStorey anonyObj = obj as AnonymousStorey;
                                     anonyObj.Stfld(fieldIndex, evaluationStackBase, evaluationStackPointer - 1, 
                                         managedStack);
                                     evaluationStackPointer = ptr;
@@ -2143,7 +2179,16 @@ namespace IFix.Core
                                 ptr->Value1 = arr[idx];
                             }
                             break;
-                        //case Code.Ldelem_Any: //0.05657366% 泛型中使用？泛型不支持解析，所以不会碰到这指令
+                        case Code.Ldelem_Any: //0.05657366% 
+                            {
+                                var arrPtr = evaluationStackPointer - 1 - 1;
+                                int idx = (evaluationStackPointer - 1)->Value1;
+                                var arr = managedStack[arrPtr->Value1] as Array;
+                                EvaluationStackOperation.PushObject(evaluationStackBase, arrPtr, managedStack,
+                                        arr.GetValue(idx), arr.GetType().GetElementType());
+                                evaluationStackPointer = evaluationStackPointer - 1;
+                            }
+                            break;
                         case Code.Ldc_R8: //0.05088072%
                             {
                                 *(double*)&evaluationStackPointer->Value1 = *(double*)(pc + 1); 
@@ -2180,7 +2225,7 @@ namespace IFix.Core
                                 switch (obj->Type)
                                 {
                                     case ValueType.Integer:
-                                        val = (ulong)obj->Value1;
+                                        val = *(uint*)&obj->Value1;//Conv_U8的操作数肯定是uint
                                         break;
                                     case ValueType.Long:
                                         pc++;
@@ -2292,8 +2337,8 @@ namespace IFix.Core
                                 var pn = anonymousStoreyInfo.CtorParamNum;
                                 //_Info("param count:" + pn + ", ctor id:" + anonymousStoreyInfo.CtorId);
                                 AnonymousStorey anonymousStorey = (anonymousStoreyInfo.Slots == null)
-                                    ? new AnonymousStorey(anonymousStoreyInfo.FieldNum, anonymousStoreyInfo.FieldTypes)
-                                    : wrappersManager.CreateBridge(anonymousStoreyInfo.FieldNum, anonymousStoreyInfo.FieldTypes,
+                                    ? new AnonymousStorey(anonymousStoreyInfo.FieldNum, anonymousStoreyInfo.FieldTypes, pc->Operand, anonymousStoreyInfo.VTable, this)
+                                    : wrappersManager.CreateBridge(anonymousStoreyInfo.FieldNum, anonymousStoreyInfo.FieldTypes, pc->Operand, anonymousStoreyInfo.VTable,
                                     anonymousStoreyInfo.Slots, this);
 
                                 var pos = evaluationStackPointer;
@@ -2321,7 +2366,20 @@ namespace IFix.Core
                                 evaluationStackPointer = pos + 1;
                             }
                             break;
-                        //case Code.Stelem_Any: //0.03166702% 泛型中使用？泛型不支持解析，所以不会碰到这指令
+                        case Code.Stelem_Any: //0.03166702% 
+                            {
+                                var arrPtr = evaluationStackPointer - 1 - 1 - 1;
+                                int idx = (evaluationStackPointer - 1 - 1)->Value1;
+                                var valPtr = evaluationStackPointer - 1;
+                                var arr = managedStack[arrPtr->Value1] as Array;
+                                var val = EvaluationStackOperation.ToObject(evaluationStackBase, valPtr,
+                                        managedStack, arr.GetType().GetElementType(), this, false);
+                                arr.SetValue(val, idx);
+                                managedStack[arrPtr - evaluationStackBase] = null; //清理，如果有的话
+                                managedStack[valPtr - evaluationStackBase] = null;
+                                evaluationStackPointer = arrPtr;
+                            }
+                            break;
                         case Code.Conv_U2: //0.02917635%
                             {
                                 var obj = evaluationStackPointer - 1;
